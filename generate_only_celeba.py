@@ -91,7 +91,7 @@ def build_cnns(num_cls: int, blur_parameter: float, center_parameter: float, ker
     return cnns
 
 
-def save_tensor_as_image(x: torch.Tensor, out_path: str, quality: int = 95):
+def save_tensor_as_image(x: torch.Tensor, out_path: str, image_format: str):
     """
     x: [3,H,W] in [0,1]
     """
@@ -99,7 +99,12 @@ def save_tensor_as_image(x: torch.Tensor, out_path: str, quality: int = 95):
     # save with PIL
     x = x.detach().clamp(0, 1).cpu()
     arr = (x.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
-    Image.fromarray(arr).save(out_path, quality=quality)
+    if image_format == "png":
+        Image.fromarray(arr).save(out_path, format="PNG")
+    elif image_format == "jpg":
+        Image.fromarray(arr).save(out_path, format="JPEG", quality=100)
+    else:
+        raise ValueError(f"Unsupported image_format={image_format}")
 
 
 def main():
@@ -125,7 +130,7 @@ def main():
 
     p.add_argument("--grayscale", action="store_true")
     p.add_argument("--same-filter", action="store_true")
-    p.add_argument("--save-quality", type=int, default=100)
+    p.add_argument("--image-format", type=str, default="png", choices=["png", "jpg"])
 
     args = p.parse_args()
 
@@ -235,10 +240,11 @@ def main():
         t_save_start = time.perf_counter()
         for i, out_img in enumerate(out_batch):
             clean_path = paths[i]
-            fname = os.path.basename(clean_path)
+            ext = ".png" if args.image_format == "png" else ".jpg"
+            fname = os.path.splitext(os.path.basename(clean_path))[0] + ext
             poisoned_path = os.path.join(args.out_images_dir, fname)
 
-            save_tensor_as_image(out_img, poisoned_path, quality=args.save_quality)
+            save_tensor_as_image(out_img, poisoned_path, image_format=args.image_format)
             poison_rows.append((clean_path, poisoned_path))
 
         t_save_cpu += (time.perf_counter() - t_save_start)

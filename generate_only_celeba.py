@@ -21,7 +21,7 @@ class PathLabelDataset(Dataset):
     Deterministic: no shuffling; order is the CSV order.
     """
 
-    def __init__(self, samples: List[Tuple[str, int]], input_size: int, interpolation: str):
+    def __init__(self, samples: List[Tuple[str, int]], input_size: int):
         # Resizes: forces images to a fixed size
         # TODO: INVESTIGATE CENTERCROP FOR IMAGES TO RETAIN FACIAL DATA
         # Interpolation mode: required to specify how resizing computes new pixels
@@ -30,18 +30,8 @@ class PathLabelDataset(Dataset):
 
         self.samples = samples
 
-        interp_map = {
-            "nearest": transforms.InterpolationMode.NEAREST,
-            "bilinear": transforms.InterpolationMode.BILINEAR,
-            "bicubic": transforms.InterpolationMode.BICUBIC,
-            "lanczos": transforms.InterpolationMode.LANCZOS,
-        }
-        if interpolation not in interp_map:
-            raise ValueError(f"Unknown interpolation={interpolation}. Choose from {list(interp_map.keys())}")
-
-
         self.tf = transforms.Compose([
-            transforms.Resize((input_size, input_size), interpolation=interp_map[interpolation]),
+            transforms.Resize((input_size, input_size), interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.ToTensor(),  # [0,1] shape: [3,H,W]
         ])
 
@@ -91,16 +81,16 @@ def build_cnns(num_cls: int, blur_parameter: float, center_parameter: float, ker
     return cnns
 
 
-def save_tensor_as_image(x: torch.Tensor, out_path: str, image_format: str):
-    """
-    x: [3,H,W] in [0,1]
-    """
-    # Clamp to [0,1], move to CPU, permute to [H,W,C], scale to [0,255], convert to uint8
-    # save with PIL
+def tensor_to_uint8_hwc(x: torch.Tensor) -> np.ndarray:
+    """Convert float tensor [3,H,W] in [0,1] to uint8 HWC (0-255)."""
     x = x.detach().clamp(0, 1).cpu()
-    arr = (x.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+    return (x.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+
+
+def save_uint8_hwc(arr: np.ndarray, out_path: str, image_format: str):
+    """Save uint8 HWC array to disk with requested format."""
     if image_format == "png":
-        Image.fromarray(arr).save(out_path, format="PNG")
+        Image.fromarray(arr).save(out_path, format="PNG", compress_level=0)
     elif image_format == "jpg":
         Image.fromarray(arr).save(out_path, format="JPEG", quality=100)
     else:
@@ -121,8 +111,6 @@ def main():
     p.add_argument("--center-parameter", type=float, default=1.0)
     p.add_argument("--kernel-size", type=int, default=3)
     p.add_argument("--input-size", type=int, default=112)
-    p.add_argument("--interpolation", type=str, default="bilinear",
-                   choices=["nearest", "bilinear", "bicubic", "lanczos"])
 
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=4)
@@ -173,7 +161,7 @@ def main():
     t_filters = time.perf_counter() - t0
 
     # Dataset + loaders
-    ds = PathLabelDataset(samples, input_size=args.input_size, interpolation=args.interpolation)
+    ds = PathLabelDataset(samples, input_size=args.input_size)
     dl = DataLoader(ds, 
                     batch_size=args.batch_size, 
                     shuffle=False, 
@@ -194,7 +182,6 @@ def main():
     if use_cuda_timing:
         start_evt = torch.cuda.Event(enable_timing=True)
         end_evt = torch.cuda.Event(enable_timing=True)
-
 
     # Poison generation Loop (PULLED FROM CUDA SCRIPT)
     poison_rows = []
@@ -244,7 +231,9 @@ def main():
             fname = os.path.splitext(os.path.basename(clean_path))[0] + ext
             poisoned_path = os.path.join(args.out_images_dir, fname)
 
-            save_tensor_as_image(out_img, poisoned_path, image_format=args.image_format)
+            poisoned_arr = tensor_to_uint8_hwc(out_img)
+
+            save_uint8_hwc(poisoned_arr, poisoned_path, image_format=args.image_format)
             poison_rows.append((clean_path, poisoned_path))
 
         t_save_cpu += (time.perf_counter() - t_save_start)

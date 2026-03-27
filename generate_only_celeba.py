@@ -17,11 +17,12 @@ from torchvision import transforms
 
 class PathLabelDataset(Dataset):
     """
-    Loads images from disk (paths) and produces (tensor, label, clean_path).
+    Loads images from disk and produces
+    (tensor, label, clean_path, poisoned_rel_path).
     Deterministic: no shuffling; order is the CSV order.
     """
 
-    def __init__(self, samples: List[Tuple[str, int]], input_size: int):
+    def __init__(self, samples: List[Tuple[str, int, str]], input_size: int):
         # Resizes: forces images to a fixed size
         # TODO: INVESTIGATE CENTERCROP FOR IMAGES TO RETAIN FACIAL DATA
         # Interpolation mode: required to specify how resizing computes new pixels
@@ -40,10 +41,27 @@ class PathLabelDataset(Dataset):
 
     def __getitem__(self, idx: int):
         # Loads image, coverts to RGB, applies transforms
-        path, label = self.samples[idx]
+        path, label, poisoned_rel_path = self.samples[idx]
         img = Image.open(path).convert("RGB")
         x = self.tf(img)
-        return x, int(label), path
+        return x, int(label), path, poisoned_rel_path
+
+
+def resolve_poisoned_output_path(out_images_dir: str, clean_path: str, poisoned_rel_path: str, image_format: str) -> str:
+    ext = ".png" if image_format == "png" else ".jpg"
+    fallback_name = os.path.splitext(os.path.basename(clean_path))[0] + ext
+
+    rel = (poisoned_rel_path or "").strip()
+    if not rel:
+        rel = fallback_name
+    else:
+        rel = os.path.normpath(rel)
+        if os.path.isabs(rel):
+            raise RuntimeError(f"poisoned_rel_path must be relative, got absolute path: {poisoned_rel_path}")
+        if rel == ".." or rel.startswith(".." + os.sep):
+            raise RuntimeError(f"poisoned_rel_path escapes output directory: {poisoned_rel_path}")
+
+    return os.path.abspath(os.path.join(out_images_dir, rel))
 
 
 def build_cnns(num_cls: int, blur_parameter: float, center_parameter: float, kernel_size: int, seed: int, device: str, same_filter: bool):
@@ -131,14 +149,14 @@ def main():
     os.makedirs(os.path.dirname(args.out_metrics_json), exist_ok=True)
 
     # Load samples
-    samples: List[Tuple[str, int]] = []
+    samples: List[Tuple[str, int, str]] = []
     with open(args.samples_csv, "r", newline="") as f:
         r = csv.DictReader(f)
         for row in r:
-            samples.append((row["clean_path"], int(row["label"])))
+            samples.append((row["clean_path"], int(row["label"]), row.get("poisoned_rel_path", "")))
 
     # Determine num_cls from max label (IMPORTANT NOTE: expects labels are 0..C-1)
-    labels = [y for _, y in samples]
+    labels = [y for _, y, _ in samples]
     num_cls = max(labels) + 1 if labels else 0
     if num_cls <= 0:
         raise RuntimeError("No samples provided.")
@@ -188,7 +206,8 @@ def main():
     t_total_start = time.perf_counter()
     torch.set_grad_enabled(False)
 
-    for xb, yb, paths in tqdm(dl, total=len(dl), desc="CUDA generate"):
+    seen_poisoned_paths = set()
+    for xb, yb, paths, poisoned_rel_paths in tqdm(dl, total=len(dl), desc="CUDA generate"):
         # Moves batches to GPU
         xb = xb.to(args.device, non_blocking=True)
         yb = yb.to(args.device, non_blocking=True)
@@ -227,9 +246,21 @@ def main():
         t_save_start = time.perf_counter()
         for i, out_img in enumerate(out_batch):
             clean_path = paths[i]
-            ext = ".png" if args.image_format == "png" else ".jpg"
-            fname = os.path.splitext(os.path.basename(clean_path))[0] + ext
-            poisoned_path = os.path.join(args.out_images_dir, fname)
+            poisoned_path = resolve_poisoned_output_path(
+                out_images_dir=args.out_images_dir,
+                clean_path=clean_path,
+                poisoned_rel_path=poisoned_rel_paths[i],
+                image_format=args.image_format,
+            )
+
+            if poisoned_path in seen_poisoned_paths:
+                raise RuntimeError(
+                    f"Duplicate poisoned output path detected: {poisoned_path}. "
+                    "Regenerate with unique per-sample relative paths."
+                )
+            seen_poisoned_paths.add(poisoned_path)
+
+            os.makedirs(os.path.dirname(poisoned_path), exist_ok=True)
 
             poisoned_arr = tensor_to_uint8_hwc(out_img)
 
